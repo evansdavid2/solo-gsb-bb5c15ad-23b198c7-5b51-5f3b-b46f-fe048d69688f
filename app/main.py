@@ -10,6 +10,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
+from .rehearsal import (
+    RehearsalError,
+    RepeatSection,
+    locate_rehearsal_timestamps,
+)
 from .storage import PlanStore
 
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -96,6 +101,71 @@ class PlanResponse(BaseModel):
     result: PlanResult
 
 
+class RepeatSectionRequest(BaseModel):
+    """重复段：原谱 0 基闭区间，含起止小节。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_measure: int = Field(..., description="重复段起始小节序号（0 基，含）")
+    end_measure: int = Field(..., description="重复段结束小节序号（0 基，含）")
+    play_count: int = Field(
+        ..., ge=2, le=4, description="该段完整演奏次数（含首遍），取值 2～4"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "RepeatSectionRequest":
+        if self.start_measure < 0:
+            raise ValueError("start_measure 不能为负数")
+        if self.end_measure < self.start_measure:
+            raise ValueError("end_measure 不能小于 start_measure（起止均含）")
+        return self
+
+
+class LocateTimestampsRequest(BaseModel):
+    """排练录音时间戳定位请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    beats_per_measure: List[float] = Field(
+        ..., description="依次排列的每小节拍数（与原小节等长：每个原谱小节一个）"
+    )
+    tempo_bpm: float = Field(..., gt=0, description="每分钟拍数（全曲统一速度）")
+    repeat_sections: List[RepeatSectionRequest] = Field(
+        default_factory=list,
+        description="若干不相交且不嵌套的重复段（起止小节均含、演奏 2～4 次）",
+    )
+    timestamps: List[float] = Field(
+        ..., description="排练录音时间戳数组（秒，以演奏开始为 0）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "LocateTimestampsRequest":
+        if not self.beats_per_measure:
+            raise ValueError("beats_per_measure 不能为空")
+        if any(b <= 0 for b in self.beats_per_measure):
+            raise ValueError("beats_per_measure 中每个小节拍数必须为正数")
+        if any(t < 0 for t in self.timestamps):
+            raise ValueError("timestamps 不能为负数（以演奏开始为 0）")
+        return self
+
+
+class LocationOut(BaseModel):
+    timestamp: float = Field(..., description="回显请求中的时间戳（秒）")
+    measure: int = Field(..., description="对应的原谱小节序号（0 基）")
+    iteration: int = Field(
+        ..., description="重复段内第几遍（1 基）；非重复段小节为 1"
+    )
+    beat_offset: float = Field(..., description="该小节内的拍数偏移（可为小数）")
+    page_index: int = Field(..., description="已存方案的页码（从 1 开始）")
+
+
+class LocateTimestampsResponse(BaseModel):
+    id: str
+    measure_count: int
+    total_duration: float = Field(..., description="展开重复段后的演奏总时长（秒）")
+    locations: List[LocationOut]
+
+
 def _plan_to_result(plan: Plan) -> PlanResult:
     return PlanResult(
         page_count=plan.page_count,
@@ -153,3 +223,56 @@ def get_plan(plan_id: str) -> PlanResponse:
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/rehearsal/locations",
+    response_model=LocateTimestampsResponse,
+)
+def locate_timestamps(
+    plan_id: str, payload: LocateTimestampsRequest
+) -> LocateTimestampsResponse:
+    """按已存规划展开重复段，把排练录音时间戳定位回原谱小节/页码。"""
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    saved_request = PlanRequest(**record["request"])
+    saved_result = PlanResult(**record["result"])
+    sections = [
+        RepeatSection(
+            start_measure=s.start_measure,
+            end_measure=s.end_measure,
+            times=s.play_count,
+        )
+        for s in payload.repeat_sections
+    ]
+    try:
+        total_duration, locations = locate_rehearsal_timestamps(
+            measure_count=len(saved_request.measure_heights),
+            beats_per_measure=payload.beats_per_measure,
+            tempo_bpm=payload.tempo_bpm,
+            repeat_sections=sections,
+            timestamps=payload.timestamps,
+            breaks=saved_result.breaks,
+        )
+    except RehearsalError as exc:
+        # 长度不符 / 重复段重叠嵌套 / 时间戳超出总时长：语义错误，明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return LocateTimestampsResponse(
+        id=record["id"],
+        measure_count=len(saved_request.measure_heights),
+        total_duration=total_duration,
+        locations=[
+            LocationOut(
+                timestamp=loc.timestamp,
+                measure=loc.measure,
+                iteration=loc.iteration,
+                beat_offset=loc.beat_offset,
+                page_index=loc.page_index,
+            )
+            for loc in locations
+        ],
+    )
